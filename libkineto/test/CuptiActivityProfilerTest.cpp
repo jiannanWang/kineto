@@ -815,6 +815,92 @@ TEST_F(CuptiActivityProfilerTest, GpuNCCLCollectiveTest) {
 #endif
 }
 
+// Verify that NCCL metadata is correctly attached to GPU kernel events even
+// when the external correlation record appears AFTER the kernel record in the
+// CUPTI activity buffer. This exercises the two-pass processing in
+// processGpuActivities(): pass 1 populates correlation maps, pass 2 processes
+// kernels that can then resolve their linked CPU activity.
+TEST_F(CuptiActivityProfilerTest, NcclMetadataOutOfOrderCorrelation) {
+  std::vector<std::string> log_modules(
+      {"CuptiActivityProfiler.cpp", "output_json.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+
+  int64_t kernelLaunchTime = start_time_ns + 20;
+  profiler.recordThreadInfo();
+
+  // Prepare metadata map with NCCL collective info
+  std::unordered_map<std::string, std::string> metadataMap;
+  metadataMap.emplace(kCollectiveName, fmt::format("\"{}\"", "all_reduce"));
+  metadataMap.emplace(kDtype, fmt::format("\"{}\"", "Float"));
+  metadataMap.emplace(kInMsgNelems, "1024");
+  metadataMap.emplace(kOutMsgNelems, "1024");
+  metadataMap.emplace(kGroupSize, "8");
+  metadataMap.emplace(
+      kProcessGroupName, fmt::format("\"{}\"", "default"));
+  metadataMap.emplace(
+      kProcessGroupDesc, fmt::format("\"{}\"", "default_pg"));
+
+  // Set up CPU op with NCCL metadata
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp(
+      kParamCommsCallName,
+      kernelLaunchTime,
+      kernelLaunchTime + 10,
+      1,
+      metadataMap);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // KEY: Place the collective kernel activity BEFORE its correlation
+  // record in the buffer. This simulates the out-of-order delivery
+  // that CUPTI can produce.
+  auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
+  gpuOps->addCollectiveActivity(
+      kernelLaunchTime + 5, kernelLaunchTime + 10, 1);
+  gpuOps->addCorrelationActivity(
+      1, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 1);
+  cuptiActivities_.activityBuffer = std::move(gpuOps);
+
+  // Process trace
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+  EXPECT_EQ(2, trace.activities()->size());
+
+#ifdef __linux__
+  char filename[] = "/tmp/libkineto_testXXXXXX.json";
+  mkstemps(filename, 5);
+  trace.save(filename);
+
+  std::ifstream file(filename);
+  ASSERT_TRUE(file.is_open());
+  std::string jsonStr(
+      (std::istreambuf_iterator<char>(file)),
+      std::istreambuf_iterator<char>());
+
+  // Verify NCCL metadata appears on the GPU kernel event despite
+  // the correlation record arriving after the kernel in the buffer
+  EXPECT_NE(jsonStr.find("all_reduce"), std::string::npos);
+  EXPECT_NE(jsonStr.find("Collective name"), std::string::npos);
+  EXPECT_NE(jsonStr.find("In msg nelems"), std::string::npos);
+  EXPECT_NE(jsonStr.find("Out msg nelems"), std::string::npos);
+  EXPECT_NE(jsonStr.find("Process Group Name"), std::string::npos);
+  EXPECT_NE(jsonStr.find("default_pg"), std::string::npos);
+#endif
+}
+
 TEST_F(CuptiActivityProfilerTest, GpuUserAnnotationTest) {
   // Verbose logging is useful for debugging
   std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
