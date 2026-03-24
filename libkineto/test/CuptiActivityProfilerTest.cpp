@@ -845,10 +845,8 @@ TEST_F(CuptiActivityProfilerTest, NcclMetadataOutOfOrderCorrelation) {
   metadataMap.emplace(kInMsgNelems, "1024");
   metadataMap.emplace(kOutMsgNelems, "1024");
   metadataMap.emplace(kGroupSize, "8");
-  metadataMap.emplace(
-      kProcessGroupName, fmt::format("\"{}\"", "default"));
-  metadataMap.emplace(
-      kProcessGroupDesc, fmt::format("\"{}\"", "default_pg"));
+  metadataMap.emplace(kProcessGroupName, fmt::format("\"{}\"", "default"));
+  metadataMap.emplace(kProcessGroupDesc, fmt::format("\"{}\"", "default_pg"));
 
   // Set up CPU op with NCCL metadata
   auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
@@ -865,10 +863,8 @@ TEST_F(CuptiActivityProfilerTest, NcclMetadataOutOfOrderCorrelation) {
   // record in the buffer. This simulates the out-of-order delivery
   // that CUPTI can produce.
   auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
-  gpuOps->addCollectiveActivity(
-      kernelLaunchTime + 5, kernelLaunchTime + 10, 1);
-  gpuOps->addCorrelationActivity(
-      1, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 1);
+  gpuOps->addCollectiveActivity(kernelLaunchTime + 5, kernelLaunchTime + 10, 1);
+  gpuOps->addCorrelationActivity(1, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 1);
   cuptiActivities_.activityBuffer = std::move(gpuOps);
 
   // Process trace
@@ -887,8 +883,7 @@ TEST_F(CuptiActivityProfilerTest, NcclMetadataOutOfOrderCorrelation) {
   std::ifstream file(filename);
   ASSERT_TRUE(file.is_open());
   std::string jsonStr(
-      (std::istreambuf_iterator<char>(file)),
-      std::istreambuf_iterator<char>());
+      (std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
   // Verify NCCL metadata appears on BOTH the CPU and GPU events.
   // With count == 2, we know the GPU kernel got the metadata propagated
