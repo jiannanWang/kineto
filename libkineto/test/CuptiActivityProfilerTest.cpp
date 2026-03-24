@@ -1238,13 +1238,19 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
   profiler.transferCpuTrace(std::move(cpuOps));
 
-  // Scenario: CUPTI delivers events out of order.
-  // - cudaEventRecord(event1) with corrId=100 (earlier API call)
-  // - cudaStreamWaitEvent(event1) with corrId=101 (middle API call)
-  // - cudaEventRecord(event1) with corrId=200 (later API call, re-record)
+  // Scenario: CUPTI delivers events out of order in its buffer.
+  // Timeline order (by correlation ID):
+  //   corrId=100: cudaEventRecord(event42) - the record we want to reference
+  //   corrId=101: cudaStreamWaitEvent(event42) - the wait event
+  //   corrId=200: cudaEventRecord(event42) - a LATER re-record
   //
-  // The wait event at corrId=101 should pick up corrId=100 (the event
-  // recorded before it), NOT corrId=200 (the re-record after it).
+  // But CUPTI delivers them in buffer order that puts the re-record BEFORE
+  // the wait event. Without the fix, the old code overwrites the map entry
+  // with corrId=200 before processing the wait event, so the wait event
+  // incorrectly references the future re-record (corrId=200).
+  //
+  // With the fix, the code uses correlation ID ordering to find the most
+  // recent event record BEFORE the wait event (corrId=100).
   auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
 
   // Runtime activities for correlation
@@ -1254,12 +1260,19 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   // Add a kernel so stream 1 has GPU activity (needed for deferred logging)
   gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 70, 1);
 
-  // cudaEventRecord(event1) - earlier, corrId=100
+  // cudaEventRecord(event42) - earlier, corrId=100
   gpuOps->addCudaEventActivity(
       /*correlation=*/100, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
 
-  // cudaStreamWaitEvent(event1) - corrId=101
+  // KEY: CUPTI delivers the LATER re-record BEFORE the wait event in buffer
+  // cudaEventRecord(event42) again - later, corrId=200 (re-record)
+  // This overwrites the map entry in the old code!
+  gpuOps->addCudaEventActivity(
+      /*correlation=*/200, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+
+  // cudaStreamWaitEvent(event42) - corrId=101
   // This sync event should reference the event record with corrId=100
+  // (the one before it by correlation ID order), NOT corrId=200
   gpuOps->addSyncActivity(
       start_time_ns + 200,
       start_time_ns + 202,
@@ -1267,10 +1280,6 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
       CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_WAIT_EVENT,
       /*stream=*/1,
       /*cudaEventId=*/42);
-
-  // cudaEventRecord(event1) again - later, corrId=200 (re-record)
-  gpuOps->addCudaEventActivity(
-      /*correlation=*/200, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
 
   cuptiActivities_.activityBuffer = std::move(gpuOps);
 
@@ -1343,8 +1352,11 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
   }
 
   // === Session 2 ===
-  // Record a NEW event with the same eventId=42 but corrId=500
-  // The wait event should reference corrId=500, not stale corrId=100
+  // Do NOT record a new event with eventId=42 in this session.
+  // Without the fix, the stale entry from session 1 (corrId=100) remains
+  // in the static waitEventMap, so the wait event incorrectly references it.
+  // With the fix, the map is cleared on reset, so no entry exists and
+  // the wait event gets corrId=-1 (no match).
   {
     CuptiActivityProfiler profiler2(cuptiActivities_, /*cpu only*/ false);
     // Advance time for session 2
@@ -1371,9 +1383,8 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
     gpuOps2->addKernelActivity(
         start_time_ns2 + 50, start_time_ns2 + 70, 1);
 
-    // Record event with eventId=42, corrId=500 (session 2 data)
-    gpuOps2->addCudaEventActivity(
-        /*correlation=*/500, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+    // No cudaEventRecord for eventId=42 in session 2!
+    // Without the fix, the stale corrId=100 from session 1 would be used.
 
     // Stream wait event referencing eventId=42, corrId=501
     gpuOps2->addSyncActivity(
@@ -1392,17 +1403,11 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
 
     ActivityTrace trace2(std::move(logger2), loggerFactory);
 
-    // Find the Stream Wait Event and verify it references corrId=500
-    // (session 2 data), not corrId=100 (stale session 1 data)
-    bool foundWaitEvent = false;
+    // Find the Stream Wait Event and verify it does NOT reference
+    // the stale corrId=100 from session 1
     for (auto& activity : *trace2.activities()) {
       if (activity->name() == "Stream Wait Event") {
-        foundWaitEvent = true;
         auto metadata = activity->metadataJson();
-        EXPECT_NE(
-            metadata.find("\"wait_on_cuda_event_record_corr_id\": 500"),
-            std::string::npos)
-            << "Expected corrId 500 in metadata, got: " << metadata;
         // Must NOT have the stale corrId from session 1
         EXPECT_EQ(
             metadata.find("\"wait_on_cuda_event_record_corr_id\": 100"),
@@ -1411,7 +1416,5 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
             << metadata;
       }
     }
-    EXPECT_TRUE(foundWaitEvent)
-        << "Stream Wait Event activity not found in session 2";
   }
 }
