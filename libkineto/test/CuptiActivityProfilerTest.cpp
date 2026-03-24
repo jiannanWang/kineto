@@ -215,11 +215,8 @@ struct MockCuptiActivityBuffer {
       uint32_t eventId,
       uint32_t streamId = 1,
       uint32_t contextId = 0) {
-    auto& act = *static_cast<CUpti_ActivityCudaEventType*>(
-        malloc(sizeof(CUpti_ActivityCudaEventType)));
-    bzero(&act, sizeof(act));
+    auto& act = createActivity<CUpti_ActivityCudaEventType>(correlation);
     act.kind = CUPTI_ACTIVITY_KIND_CUDA_EVENT;
-    act.correlationId = correlation;
     act.eventId = eventId;
     act.streamId = streamId;
     act.contextId = contextId;
@@ -252,6 +249,16 @@ struct MockCuptiActivityBuffer {
     bzero(&act, sizeof(act));
     act.start = start_ns;
     act.end = end_ns;
+    act.correlationId = correlation;
+    return act;
+  }
+
+  // Overload for activity types without start/end fields (e.g.
+  // CUpti_ActivityCudaEvent).
+  template <class T>
+  T& createActivity(int64_t correlation) {
+    T& act = *static_cast<T*>(malloc(sizeof(T)));
+    bzero(&act, sizeof(act));
     act.correlationId = correlation;
     return act;
   }
