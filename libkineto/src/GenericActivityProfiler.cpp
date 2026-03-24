@@ -228,6 +228,68 @@ GenericActivityProfiler::CpuGpuSpanPair& GenericActivityProfiler::
   return iterations.back();
 }
 
+void GenericActivityProfiler::fixBackwardOperationNesting(
+    libkineto::CpuTraceBuffer& cpuTrace) {
+  if (cpuTrace.activities.size() < 2) {
+    return;
+  }
+
+  // Build a vector of raw pointers sorted by start time for analysis.
+  std::vector<GenericTraceActivity*> sortedActs;
+  sortedActs.reserve(cpuTrace.activities.size());
+  for (auto& act : cpuTrace.activities) {
+    sortedActs.push_back(act.get());
+  }
+  std::sort(sortedActs.begin(), sortedActs.end(),
+            [](const auto* a, const auto* b) {
+              return a->startTime < b->startTime;
+            });
+
+  // For each evaluate_function span, ensure it does not extend past
+  // the start of the next evaluate_function at the same nesting level.
+  // When it does, truncate it to end at the latest-ending child that
+  // genuinely belongs to it (i.e., a child that ends before the next
+  // evaluate_function begins).
+  for (size_t i = 0; i < sortedActs.size(); i++) {
+    auto* act = sortedActs[i];
+    if (act->activityName.find("evaluate_function") == std::string::npos) {
+      continue;
+    }
+
+    // Find the next evaluate_function that starts within our current span.
+    for (size_t j = i + 1; j < sortedActs.size(); j++) {
+      auto* next = sortedActs[j];
+      if (next->startTime >= act->endTime) {
+        break; // Already past our end time
+      }
+      if (next->activityName.find("evaluate_function") != std::string::npos &&
+          next->startTime > act->startTime) {
+        // A peer evaluate_function starts within our span -- we may be
+        // extending too far.  Find the latest-ending child activity
+        // that starts within our span but ends before this next
+        // evaluate_function begins.
+        int64_t lastChildEnd = act->startTime;
+        for (size_t k = i + 1; k < sortedActs.size(); k++) {
+          auto* child = sortedActs[k];
+          if (child->startTime >= next->startTime) {
+            break;
+          }
+          if (child->startTime >= act->startTime &&
+              child->endTime <= next->startTime) {
+            lastChildEnd = std::max(lastChildEnd, child->endTime);
+          }
+        }
+
+        if (lastChildEnd < next->startTime && act->endTime > next->startTime) {
+          // Truncate this evaluate_function to end at its last real child.
+          act->endTime = lastChildEnd;
+        }
+        break;
+      }
+    }
+  }
+}
+
 void GenericActivityProfiler::processCpuTrace(
     libkineto::CpuTraceBuffer& cpuTrace,
     ActivityLogger& logger) {
@@ -235,6 +297,9 @@ void GenericActivityProfiler::processCpuTrace(
     LOG(WARNING) << "CPU trace is empty!";
     return;
   }
+  // Fix evaluate_function spans that incorrectly wrap subsequent backward
+  // steps due to an endTime that is too late.
+  fixBackwardOperationNesting(cpuTrace);
   setCpuActivityPresent(true);
   bool warn_once = false;
   CpuGpuSpanPair& span_pair =

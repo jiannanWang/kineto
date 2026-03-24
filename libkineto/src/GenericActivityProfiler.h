@@ -324,6 +324,11 @@ class GenericActivityProfiler {
   // Process a single CPU trace
   void processCpuTrace(libkineto::CpuTraceBuffer& cpuTrace, ActivityLogger& logger);
 
+  // Fix mis-nested backward operations (evaluate_function spans that
+  // extend past their actual children and incorrectly wrap subsequent
+  // backward steps).
+  void fixBackwardOperationNesting(libkineto::CpuTraceBuffer& cpuTrace);
+
   inline bool hasDeviceResource(int device, int id) {
     return resourceInfo_.find({device, id}) != resourceInfo_.end();
   }

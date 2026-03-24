@@ -1181,3 +1181,135 @@ TEST_F(CuptiActivityProfilerTest, JsonGPUIDSortTest) {
   }
 #endif
 }
+
+TEST_F(CuptiActivityProfilerTest, BackwardOperationNesting) {
+  // Verify that evaluate_function spans that incorrectly extend past
+  // their actual children get truncated so they do not wrap operations
+  // belonging to a subsequent backward step.
+  std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ true);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 1000;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+
+  // evaluate_function:MulBackward0 from T=100 to T=500 (too long!)
+  // Its real child ends at T=130, but endTime erroneously reaches T=500.
+  cpuOps->addOp(
+      "autograd::engine::evaluate_function: MulBackward0",
+      start_time_ns + 100, start_time_ns + 500, 1);
+  // Actual child of MulBackward0
+  cpuOps->addOp("aten::mul", start_time_ns + 110, start_time_ns + 130, 2);
+
+  // A separate backward step that should NOT be wrapped by MulBackward0
+  cpuOps->addOp(
+      "autograd::engine::evaluate_function: AddBackward0",
+      start_time_ns + 200, start_time_ns + 300, 3);
+  cpuOps->addOp("aten::add", start_time_ns + 210, start_time_ns + 250, 4);
+
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // No GPU ops needed -- set up an empty buffer
+  cuptiActivities_.activityBuffer = std::make_unique<MockCuptiActivityBuffer>();
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+  ASSERT_NE(nullptr, trace.activities());
+
+  // Find the MulBackward0 activity and verify its endTime was truncated.
+  const ITraceActivity* mulBackward = nullptr;
+  const ITraceActivity* addBackward = nullptr;
+  for (auto* act : *trace.activities()) {
+    if (act->name().find("MulBackward0") != std::string::npos) {
+      mulBackward = act;
+    }
+    if (act->name().find("AddBackward0") != std::string::npos) {
+      addBackward = act;
+    }
+  }
+
+  ASSERT_NE(nullptr, mulBackward);
+  ASSERT_NE(nullptr, addBackward);
+
+  // MulBackward0 must end before AddBackward0 starts.
+  // Before the fix it would have ended at start_time_ns+500 which is
+  // well past AddBackward0's start at start_time_ns+200.
+  int64_t mulEnd = mulBackward->timestamp() + mulBackward->duration();
+  int64_t addStart = addBackward->timestamp();
+  EXPECT_LE(mulEnd, addStart)
+      << "MulBackward0 (end=" << mulEnd
+      << ") should not extend past AddBackward0 (start=" << addStart << ")";
+
+  // Specifically, MulBackward0 should have been truncated to end at its
+  // last real child (aten::mul) which ends at start_time_ns + 130.
+  EXPECT_EQ(mulEnd, start_time_ns + 130);
+}
+
+TEST_F(CuptiActivityProfilerTest, BackwardNestingNoFalsePositive) {
+  // Verify that evaluate_function spans that correctly contain their
+  // children are NOT modified.
+  std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ true);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 1000;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+
+  // Two correctly nested evaluate_function spans that do NOT overlap.
+  cpuOps->addOp(
+      "autograd::engine::evaluate_function: MulBackward0",
+      start_time_ns + 100, start_time_ns + 180, 1);
+  cpuOps->addOp("aten::mul", start_time_ns + 110, start_time_ns + 170, 2);
+
+  cpuOps->addOp(
+      "autograd::engine::evaluate_function: AddBackward0",
+      start_time_ns + 200, start_time_ns + 300, 3);
+  cpuOps->addOp("aten::add", start_time_ns + 210, start_time_ns + 250, 4);
+
+  profiler.transferCpuTrace(std::move(cpuOps));
+  cuptiActivities_.activityBuffer = std::make_unique<MockCuptiActivityBuffer>();
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+  ASSERT_NE(nullptr, trace.activities());
+
+  const ITraceActivity* mulBackward = nullptr;
+  for (auto* act : *trace.activities()) {
+    if (act->name().find("MulBackward0") != std::string::npos) {
+      mulBackward = act;
+    }
+  }
+
+  ASSERT_NE(nullptr, mulBackward);
+
+  // endTime should remain unchanged at start_time_ns + 180 since there
+  // is no overlap with the next evaluate_function.
+  int64_t mulEnd = mulBackward->timestamp() + mulBackward->duration();
+  EXPECT_EQ(mulEnd, start_time_ns + 180);
+}
