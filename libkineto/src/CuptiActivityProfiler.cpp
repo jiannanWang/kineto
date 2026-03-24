@@ -372,14 +372,40 @@ void CuptiActivityProfiler::handleCudaSyncActivity(
     }
   }
 
+  // For stream-level sync events (STREAM_SYNCHRONIZE), adjust start time
+  // to not overlap with preceding kernels on the same stream.
+  // CUPTI reports the sync start as the CPU-side API call time, but the
+  // GPU-side wait only begins after all preceding kernels complete.
+  int64_t adjustedStart = -1;
+  if (activity->type ==
+      CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_SYNCHRONIZE) {
+    int64_t lastEnd = getStreamLastActivityEnd(
+        device_id, static_cast<int64_t>(activity->streamId));
+    if (lastEnd >= 0) {
+      // Compute the sync's original start in converted time (same as what
+      // CuptiActivity::timestamp() would return)
+#if defined(_WIN32) || CUDA_VERSION < 11060
+      int64_t syncStart = activity->start;
+#else
+      int64_t syncStart = use_cupti_tsc()
+          ? get_time_converter()(activity->start)
+          : static_cast<int64_t>(activity->start);
+#endif
+      if (lastEnd > syncStart) {
+        adjustedStart = lastEnd;
+      }
+    }
+  }
+
   // Marshal the logging to a functor so we can defer it if needed.
   auto log_event =
-      [activity, src_stream, src_corrid, device_id, logger, this]() {
+      [activity, src_stream, src_corrid, device_id, adjustedStart, logger,
+       this]() {
         const ITraceActivity* linked =
             linkedActivity(activity->correlationId, this->cpuCorrelationMap_);
         const auto& cuda_sync_activity =
-            this->traceBuffers_->addActivityWrapper(
-                CudaSyncActivity(activity, linked, src_stream, src_corrid));
+            this->traceBuffers_->addActivityWrapper(CudaSyncActivity(
+                activity, linked, src_stream, src_corrid, adjustedStart));
 
         if (outOfRange(cuda_sync_activity)) {
           return;

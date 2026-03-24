@@ -418,6 +418,16 @@ void GenericActivityProfiler::handleGpuActivity(
   recordStream(act.deviceId(), act.resourceId(), "");
   seenDeviceStreams_.insert({act.deviceId(), act.resourceId()});
 
+  // Track the latest end time for this (device, stream) pair.
+  // This is used to adjust stream sync event start times so they
+  // don't visually overlap with preceding kernels in the trace.
+  int64_t actEnd = act.timestamp() + act.duration();
+  auto streamKey = DevStream{act.deviceId(), act.resourceId()};
+  auto it = streamLastActivityEnd_.find(streamKey);
+  if (it == streamLastActivityEnd_.end() || actEnd > it->second) {
+    streamLastActivityEnd_[streamKey] = actEnd;
+  }
+
   act.log(*logger);
   setGpuActivityPresent(true);
   updateGpuNetSpan(act);
@@ -794,6 +804,7 @@ void GenericActivityProfiler::resetTraceData() {
   traceSpans_.clear();
   clientActivityTraceMap_.clear();
   seenDeviceStreams_.clear();
+  streamLastActivityEnd_.clear();
   logQueue_.clear();
   traceBuffers_ = nullptr;
   metadata_.clear();

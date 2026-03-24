@@ -635,6 +635,112 @@ TEST_F(CuptiActivityProfilerTest, SyncTrace) {
 #endif
 }
 
+TEST_F(CuptiActivityProfilerTest, StreamSyncTimingAdjustment) {
+  // Test that stream sync events have their start time adjusted to not
+  // overlap with preceding GPU kernels on the same stream.
+  std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+
+  profiler.recordThreadInfo();
+
+  // CPU ops that correlate with GPU kernels
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  cpuOps->addOp("op2", start_time_ns + 30, start_time_ns + 50, 2);
+  cpuOps->addOp("op3", start_time_ns + 50, start_time_ns + 70, 3);
+  cpuOps->addOp("op4", start_time_ns + 80, start_time_ns + 100, 4);
+  cpuOps->addOp("op5", start_time_ns + 100, start_time_ns + 120, 5);
+  cpuOps->addOp("sync_op", start_time_ns + 130, start_time_ns + 400, 6);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
+
+  // Runtime activities for correlation
+  gpuOps->addCorrelationActivity(1, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 1);
+  gpuOps->addCorrelationActivity(2, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 2);
+  gpuOps->addCorrelationActivity(3, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 3);
+  gpuOps->addCorrelationActivity(4, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 4);
+  gpuOps->addCorrelationActivity(5, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 5);
+  gpuOps->addCorrelationActivity(6, CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, 6);
+
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 15, start_time_ns + 25, 1);
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 35, start_time_ns + 45, 2);
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 55, start_time_ns + 65, 3);
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 85, start_time_ns + 95, 4);
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 105, start_time_ns + 115, 5);
+  gpuOps->addRuntimeActivity(
+      CUDA_STREAM_SYNC, start_time_ns + 130, start_time_ns + 400, 6);
+
+  // 5 GPU kernels on stream 1, ending at various times
+  // Last kernel ends at start_time_ns + 350
+  gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 100, 1);
+  gpuOps->addKernelActivity(start_time_ns + 100, start_time_ns + 170, 2);
+  gpuOps->addKernelActivity(start_time_ns + 170, start_time_ns + 230, 3);
+  gpuOps->addKernelActivity(start_time_ns + 230, start_time_ns + 300, 4);
+  gpuOps->addKernelActivity(start_time_ns + 300, start_time_ns + 350, 5);
+
+  // Stream sync event: CPU launched at start_time_ns + 130, but GPU kernels
+  // don't finish until start_time_ns + 350. The sync's start should be
+  // adjusted to start_time_ns + 350.
+  gpuOps->addSyncActivity(
+      start_time_ns + 130,   // start (before last kernel ends)
+      start_time_ns + 400,   // end
+      6,                     // correlation
+      CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_SYNCHRONIZE,
+      1 /*stream*/);
+
+  cuptiActivities_.activityBuffer = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  // Find the Stream Sync activity and verify its timing was adjusted
+  const ITraceActivity* syncActivity = nullptr;
+  for (auto& activity : *trace.activities()) {
+    if (activity->name() == "Stream Sync") {
+      syncActivity = activity;
+      break;
+    }
+  }
+
+  ASSERT_NE(syncActivity, nullptr) << "Stream Sync activity not found";
+
+  // The sync's start time should have been adjusted to at least the end
+  // of the last kernel (start_time_ns + 350), not the original
+  // start_time_ns + 130
+  EXPECT_GE(syncActivity->timestamp(), start_time_ns + 350)
+      << "Stream sync start time should be adjusted to after last kernel end";
+
+  // The end time should remain at start_time_ns + 400
+  int64_t syncEnd = syncActivity->timestamp() + syncActivity->duration();
+  EXPECT_EQ(syncEnd, start_time_ns + 400)
+      << "Stream sync end time should remain unchanged";
+
+  // Duration should be adjusted (shorter)
+  EXPECT_EQ(syncActivity->duration(), 50)
+      << "Stream sync duration should be adjusted to 50 "
+      << "(from original end 400 - adjusted start 350)";
+}
+
 TEST_F(CuptiActivityProfilerTest, GpuNCCLCollectiveTest) {
   // Set logging level for debugging purpose
   std::vector<std::string> log_modules(

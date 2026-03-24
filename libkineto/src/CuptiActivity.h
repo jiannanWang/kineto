@@ -208,10 +208,27 @@ struct CudaSyncActivity : public CuptiActivity<CUpti_ActivitySynchronization> {
   explicit CudaSyncActivity(const CUpti_ActivitySynchronization* activity,
                             const ITraceActivity* linked,
                             int32_t srcStream,
-                            int32_t srcCorrId)
-      : CuptiActivity(activity, linked), srcStream_(srcStream), srcCorrId_(srcCorrId) {}
+                            int32_t srcCorrId,
+                            int64_t adjustedStartTime = -1)
+      : CuptiActivity(activity, linked), srcStream_(srcStream), srcCorrId_(srcCorrId),
+        adjustedStartTime_(adjustedStartTime) {}
   int64_t correlationId() const override {
     return raw().correlationId;
+  }
+  int64_t timestamp() const override {
+    if (adjustedStartTime_ >= 0) {
+      return adjustedStartTime_;
+    }
+    return CuptiActivity<CUpti_ActivitySynchronization>::timestamp();
+  }
+  int64_t duration() const override {
+    if (adjustedStartTime_ >= 0) {
+      int64_t originalEnd =
+          CuptiActivity<CUpti_ActivitySynchronization>::timestamp() +
+          CuptiActivity<CUpti_ActivitySynchronization>::duration();
+      return std::max<int64_t>(0, originalEnd - adjustedStartTime_);
+    }
+    return CuptiActivity<CUpti_ActivitySynchronization>::duration();
   }
   int64_t deviceId() const override;
   int64_t resourceId() const override;
@@ -231,6 +248,7 @@ struct CudaSyncActivity : public CuptiActivity<CUpti_ActivitySynchronization> {
  private:
   const int32_t srcStream_;
   const int32_t srcCorrId_;
+  int64_t adjustedStartTime_{-1};
 };
 
 // Use CUpti_ActivityCudaEvent2 in CUDA 12.8+ for enhanced event tracking

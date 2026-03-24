@@ -363,6 +363,13 @@ class GenericActivityProfiler {
   bool outOfRange(const ITraceActivity& act);
   void handleGpuActivity(const ITraceActivity& act, ActivityLogger* logger);
 
+  // Get the latest GPU activity end time for a given (device, stream) pair.
+  // Returns -1 if no activity has been seen on the stream.
+  int64_t getStreamLastActivityEnd(int64_t device, int64_t stream) const {
+    auto it = streamLastActivityEnd_.find(DevStream{device, stream});
+    return it != streamLastActivityEnd_.end() ? it->second : -1;
+  }
+
   void resetTraceData();
 
   void addOverheadSample(profilerOverhead& counter, int64_t overhead) {
@@ -488,6 +495,11 @@ class GenericActivityProfiler {
   // doing CUDA kernels/memcopies. This prevents emitting CUDA sync
   // events on streams with no activity.
   std::unordered_set<DevStream, DevStreamHash> seenDeviceStreams_;
+
+  // Track latest GPU activity end time per (device, stream) for sync timing
+  // adjustment. Used to prevent stream sync events from visually overlapping
+  // with GPU kernels in the trace viewer.
+  std::unordered_map<DevStream, int64_t, DevStreamHash> streamLastActivityEnd_;
 
   // Buffers where trace data is stored
   std::unique_ptr<ActivityBuffers> traceBuffers_;
