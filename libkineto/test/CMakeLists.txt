@@ -136,6 +136,18 @@ target_link_libraries(PidInfoTest PRIVATE
     ${XPU_XPUPTI_LIBRARY})
 gtest_discover_tests(PidInfoTest)
 
+# GenericActivityProfilerTest (CPU-only, no CUPTI dependency)
+add_executable(GenericActivityProfilerTest GenericActivityProfilerTest.cpp)
+target_link_libraries(GenericActivityProfilerTest PRIVATE
+    gtest_main
+    kineto_base kineto_api
+    ${XPU_XPUPTI_LIBRARY})
+target_include_directories(GenericActivityProfilerTest PRIVATE
+    "${LIBKINETO_DIR}"
+    "${LIBKINETO_DIR}/include"
+    "${LIBKINETO_DIR}/src")
+gtest_discover_tests(GenericActivityProfilerTest)
+
 # CuptiProfilerApiTest
 # TODO: Re-enable once runtime crash in cuptiDeviceGetChipName is fixed.
 # enable_language(CUDA)

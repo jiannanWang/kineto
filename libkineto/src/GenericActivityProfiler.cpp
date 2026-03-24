@@ -236,6 +236,41 @@ void GenericActivityProfiler::processCpuTrace(
     return;
   }
   setCpuActivityPresent(true);
+
+  // Deduplicate backward flow IDs: multiple backward ops may share the same
+  // forward-backward flow ID (sequence number), making them indistinguishable
+  // in traces. Detect duplicates and assign unique IDs.
+  {
+    std::unordered_map<uint32_t, int> bwdFlowIdCount;
+    uint32_t maxFlowId = 0;
+
+    // First pass: find max flow ID and count backward flow ID usage
+    for (auto const& act : cpuTrace.activities) {
+      if (act->flowId() > 0) {
+        maxFlowId = std::max(maxFlowId, act->flow.id);
+        if (act->flowType() == kLinkFwdBwd && !act->flowStart()) {
+          bwdFlowIdCount[act->flow.id]++;
+        }
+      }
+    }
+
+    // Second pass: reassign duplicate backward flow IDs
+    std::unordered_map<uint32_t, bool> seenBwdFlowId;
+    for (auto& act : cpuTrace.activities) {
+      if (act->flowType() == kLinkFwdBwd && !act->flowStart() &&
+          act->flowId() > 0) {
+        if (bwdFlowIdCount[act->flow.id] > 1) {
+          if (seenBwdFlowId.count(act->flow.id)) {
+            // Duplicate backward flow ID - assign a new unique flow ID
+            act->flow.id = ++maxFlowId;
+          } else {
+            seenBwdFlowId[act->flow.id] = true;
+          }
+        }
+      }
+    }
+  }
+
   bool warn_once = false;
   CpuGpuSpanPair& span_pair =
       recordTraceSpan(cpuTrace.span, cpuTrace.gpuOpCount);

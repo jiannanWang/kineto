@@ -104,6 +104,29 @@ struct MockCpuActivityBuffer : public CpuTraceBuffer {
     emplace_activity(std::move(op));
     span.opCount++;
   }
+
+  // Variant that also sets the flow (forward-backward link) on the activity.
+  void addOpWithFlow(
+      std::string name,
+      int64_t startTime,
+      int64_t endTime,
+      int64_t correlation,
+      uint32_t flowId,
+      uint32_t flowType,
+      bool flowStart) {
+    GenericTraceActivity op(span, ActivityType::CPU_OP, name);
+    op.startTime = startTime;
+    op.endTime = endTime;
+    op.device = systemThreadId();
+    op.resource = systemThreadId();
+    op.id = correlation;
+    op.flow.id = flowId;
+    op.flow.type = flowType;
+    op.flow.start = flowStart ? 1 : 0;
+
+    emplace_activity(std::move(op));
+    span.opCount++;
+  }
 };
 
 // Provides ability to easily create a few test CUPTI ops
@@ -1180,4 +1203,97 @@ TEST_F(CuptiActivityProfilerTest, JsonGPUIDSortTest) {
     EXPECT_EQ(i + kExceedMaxPid, sortIdx[i]);
   }
 #endif
+}
+
+TEST_F(CuptiActivityProfilerTest, BackwardDuplicateFlowIds) {
+  // Test that multiple backward ops sharing the same forward-backward flow ID
+  // get deduplicated with unique flow IDs during processCpuTrace.
+
+  // Start and stop profiling (CPU-only mode to simplify the test)
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ true);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+  profiler.recordThreadInfo();
+
+  // Create CPU ops simulating forward and backward pass with duplicate flow IDs.
+  // The bug: multiple backward ops share the same flow ID (e.g., 42),
+  // making them indistinguishable in traces.
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+
+  // Forward op with flow ID 42 (flow start)
+  cpuOps->addOpWithFlow(
+      "forward_op", start_time_ns + 10, start_time_ns + 50, 1,
+      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/true);
+
+  // First backward op with flow ID 42 (flow end) - this is OK
+  cpuOps->addOpWithFlow(
+      "MulBackward0", start_time_ns + 60, start_time_ns + 100, 2,
+      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+
+  // Second backward op with SAME flow ID 42 (flow end) - this is the BUG
+  cpuOps->addOpWithFlow(
+      "AddBackward0", start_time_ns + 110, start_time_ns + 150, 3,
+      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+
+  // Third backward op with SAME flow ID 42 (flow end) - also a duplicate
+  cpuOps->addOpWithFlow(
+      "ReluBackward0", start_time_ns + 160, start_time_ns + 200, 4,
+      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+
+  // A non-duplicate backward op with a different flow ID 99
+  cpuOps->addOpWithFlow(
+      "SigmoidBackward0", start_time_ns + 210, start_time_ns + 250, 5,
+      /*flowId=*/99, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // Process the trace
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  // Verify the results: collect all flow IDs from backward ops
+  ActivityTrace trace(std::move(logger), loggerFactory);
+  ASSERT_NE(trace.activities(), nullptr);
+
+  std::vector<int64_t> bwdFlowIds;
+  int64_t fwdFlowId = -1;
+  for (auto& activity : *trace.activities()) {
+    if (activity->flowType() == kLinkFwdBwd) {
+      if (activity->flowStart()) {
+        fwdFlowId = activity->flowId();
+      } else {
+        bwdFlowIds.push_back(activity->flowId());
+      }
+    }
+  }
+
+  // The forward op should keep its original flow ID of 42
+  EXPECT_EQ(fwdFlowId, 42);
+
+  // We should have 4 backward ops total
+  ASSERT_EQ(bwdFlowIds.size(), 4);
+
+  // All backward flow IDs should be unique (the fix deduplicates them)
+  std::set<int64_t> uniqueBwdFlowIds(bwdFlowIds.begin(), bwdFlowIds.end());
+  EXPECT_EQ(uniqueBwdFlowIds.size(), bwdFlowIds.size())
+      << "Backward ops should have unique flow IDs after deduplication";
+
+  // The first backward op with flow ID 42 should keep it
+  EXPECT_EQ(bwdFlowIds[0], 42);
+
+  // The non-duplicate backward op (flow ID 99) should keep its ID
+  EXPECT_EQ(bwdFlowIds[3], 99);
+
+  // The duplicates should have gotten new unique flow IDs (> 99)
+  EXPECT_GT(bwdFlowIds[1], 99);
+  EXPECT_GT(bwdFlowIds[2], 99);
+  EXPECT_NE(bwdFlowIds[1], bwdFlowIds[2]);
 }
