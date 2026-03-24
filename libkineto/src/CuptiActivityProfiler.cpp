@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "ActivityBuffers.h"
 #include "Config.h"
@@ -51,10 +52,16 @@ struct WaitEventInfo {
   uint32_t correlationId;
 };
 
-// Map (ctx, eventId) -> (stream, corr Id) that recorded the CUDA event
-std::unordered_map<CtxEventPair, WaitEventInfo, CtxEventPairHash>&
+// Map (ctx, eventId) -> list of WaitEventInfo for all recorded events.
+// We store all records because CUPTI may deliver activities out of order,
+// and we need to match each wait/sync event with the most recent event
+// record that occurred before it (using correlationId as ordering proxy).
+std::unordered_map<CtxEventPair, std::vector<WaitEventInfo>, CtxEventPairHash>&
 waitEventMap() {
-  static std::unordered_map<CtxEventPair, WaitEventInfo, CtxEventPairHash>
+  static std::unordered_map<
+      CtxEventPair,
+      std::vector<WaitEventInfo>,
+      CtxEventPairHash>
       waitEventMap_;
   return waitEventMap_;
 }
@@ -168,6 +175,11 @@ void CuptiActivityProfiler::popCorrelationIdImpl(CorrelationFlowType type) {
 void CuptiActivityProfiler::onResetTraceData() {
   cupti_.teardownContext();
   KernelRegistry::singleton()->clear();
+  // Clear static maps to avoid stale entries persisting across profiling
+  // sessions. If CUDA event IDs are reused across sessions, stale entries
+  // could cause wait events to pick up incorrect correlation IDs.
+  waitEventMap().clear();
+  ctxToDeviceId().clear();
 }
 
 void CuptiActivityProfiler::onFinalizeTrace(
@@ -298,11 +310,36 @@ void CuptiActivityProfiler::handleOverheadActivity(
 
 static std::optional<WaitEventInfo> getWaitEventInfo(
     uint32_t ctx,
-    uint32_t eventId) {
+    uint32_t eventId,
+    uint32_t queryCorrelationId) {
   auto key = CtxEventPair{ctx, eventId};
   auto it = waitEventMap().find(key);
-  if (it != waitEventMap().end()) {
-    return it->second;
+  if (it != waitEventMap().end() && !it->second.empty()) {
+    // Find the event record with the highest correlationId that is still
+    // <= queryCorrelationId. Correlation IDs are monotonically increasing
+    // with API call order, so this finds the most recent cudaEventRecord
+    // that occurred before the sync/wait event.
+    const WaitEventInfo* best = nullptr;
+    for (const auto& info : it->second) {
+      if (info.correlationId <= queryCorrelationId) {
+        if (!best || info.correlationId > best->correlationId) {
+          best = &info;
+        }
+      }
+    }
+    if (best) {
+      return *best;
+    }
+    // Fallback: if no record has a correlationId <= queryCorrelationId,
+    // use the one with the smallest correlationId (handles startup edge
+    // cases where delivery order is unusual).
+    const WaitEventInfo* earliest = &it->second[0];
+    for (const auto& info : it->second) {
+      if (info.correlationId < earliest->correlationId) {
+        earliest = &info;
+      }
+    }
+    return *earliest;
   }
   return std::nullopt;
 }
@@ -316,10 +353,13 @@ void CuptiActivityProfiler::handleCudaEventActivity(
           << " streamId=" << activity->streamId
           << " contextId=" << activity->contextId;
 
-  // Update the stream, corrID the cudaEvent was last recorded on
+  // Append this event record to the list for this (ctx, eventId) pair.
+  // We store all records so that sync/wait events can find the most recent
+  // cudaEventRecord that occurred before them, avoiding incorrect matches
+  // when CUPTI delivers activities out of order.
   auto key = CtxEventPair{activity->contextId, activity->eventId};
-  waitEventMap()[key] =
-      WaitEventInfo{activity->streamId, activity->correlationId};
+  waitEventMap()[key].push_back(
+      WaitEventInfo{activity->streamId, activity->correlationId});
 
   // Create and log the CUDA event activity
   const ITraceActivity* linked =
@@ -364,8 +404,10 @@ void CuptiActivityProfiler::handleCudaSyncActivity(
   int32_t src_corrid = -1;
 
   if (isEventSync(activity->type)) {
-    auto maybe_wait_event_info =
-        getWaitEventInfo(activity->contextId, activity->cudaEventId);
+    auto maybe_wait_event_info = getWaitEventInfo(
+        activity->contextId,
+        activity->cudaEventId,
+        activity->correlationId);
     if (maybe_wait_event_info) {
       src_stream = maybe_wait_event_info->stream;
       src_corrid = maybe_wait_event_info->correlationId;

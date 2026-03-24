@@ -193,6 +193,39 @@ struct MockCuptiActivityBuffer {
     activities.push_back(reinterpret_cast<CUpti_Activity*>(&act));
   }
 
+  void addSyncActivity(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      CUpti_ActivitySynchronizationType type,
+      int64_t stream,
+      uint32_t cudaEventId) {
+    auto& act = createActivity<CUpti_ActivitySynchronization>(
+        start_ns, end_ns, correlation);
+    act.kind = CUPTI_ACTIVITY_KIND_SYNCHRONIZATION;
+    act.type = type;
+    act.contextId = 0;
+    act.streamId = stream;
+    act.cudaEventId = cudaEventId;
+    activities.push_back(reinterpret_cast<CUpti_Activity*>(&act));
+  }
+
+  void addCudaEventActivity(
+      int64_t correlation,
+      uint32_t eventId,
+      uint32_t streamId = 1,
+      uint32_t contextId = 0) {
+    auto& act = *static_cast<CUpti_ActivityCudaEventType*>(
+        malloc(sizeof(CUpti_ActivityCudaEventType)));
+    bzero(&act, sizeof(act));
+    act.kind = CUPTI_ACTIVITY_KIND_CUDA_EVENT;
+    act.correlationId = correlation;
+    act.eventId = eventId;
+    act.streamId = streamId;
+    act.contextId = contextId;
+    activities.push_back(reinterpret_cast<CUpti_Activity*>(&act));
+  }
+
   void addCollectiveActivity(
       int64_t start_ns,
       int64_t end_ns,
@@ -1180,4 +1213,205 @@ TEST_F(CuptiActivityProfilerTest, JsonGPUIDSortTest) {
     EXPECT_EQ(i + kExceedMaxPid, sortIdx[i]);
   }
 #endif
+}
+
+// Test that stream wait events correctly reference the event record that
+// occurred BEFORE them (by correlation ID order), not a later re-record
+// of the same CUDA event.
+TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
+  std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // Scenario: CUPTI delivers events out of order.
+  // - cudaEventRecord(event1) with corrId=100 (earlier API call)
+  // - cudaStreamWaitEvent(event1) with corrId=101 (middle API call)
+  // - cudaEventRecord(event1) with corrId=200 (later API call, re-record)
+  //
+  // The wait event at corrId=101 should pick up corrId=100 (the event
+  // recorded before it), NOT corrId=200 (the re-record after it).
+  auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
+
+  // Runtime activities for correlation
+  gpuOps->addRuntimeActivity(
+      CUDA_LAUNCH_KERNEL, start_time_ns + 13, start_time_ns + 18, 1);
+
+  // Add a kernel so stream 1 has GPU activity (needed for deferred logging)
+  gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 70, 1);
+
+  // cudaEventRecord(event1) - earlier, corrId=100
+  gpuOps->addCudaEventActivity(
+      /*correlation=*/100, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+
+  // cudaStreamWaitEvent(event1) - corrId=101
+  // This sync event should reference the event record with corrId=100
+  gpuOps->addSyncActivity(
+      start_time_ns + 200,
+      start_time_ns + 202,
+      /*correlation=*/101,
+      CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_WAIT_EVENT,
+      /*stream=*/1,
+      /*cudaEventId=*/42);
+
+  // cudaEventRecord(event1) again - later, corrId=200 (re-record)
+  gpuOps->addCudaEventActivity(
+      /*correlation=*/200, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+
+  cuptiActivities_.activityBuffer = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  // Find the Stream Wait Event activity and check its metadata
+  bool foundWaitEvent = false;
+  for (auto& activity : *trace.activities()) {
+    if (activity->name() == "Stream Wait Event") {
+      foundWaitEvent = true;
+      auto metadata = activity->metadataJson();
+      // The wait_on_cuda_event_record_corr_id should be 100 (the earlier
+      // event record), NOT 200 (the later re-record).
+      EXPECT_NE(metadata.find("\"wait_on_cuda_event_record_corr_id\": 100"),
+                std::string::npos)
+          << "Expected corrId 100 in metadata, got: " << metadata;
+      EXPECT_EQ(metadata.find("\"wait_on_cuda_event_record_corr_id\": 200"),
+                std::string::npos)
+          << "Should not find corrId 200 in metadata, got: " << metadata;
+    }
+  }
+  EXPECT_TRUE(foundWaitEvent) << "Stream Wait Event activity not found";
+}
+
+// Test that the waitEventMap is cleared between profiling sessions,
+// preventing stale entries from causing incorrect correlation ID lookups.
+TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
+  std::vector<std::string> log_modules({"CuptiActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+
+  // === Session 1 ===
+  // Record an event with eventId=42 and corrId=100 (stale data)
+  {
+    CuptiActivityProfiler profiler(cuptiActivities_, /*cpu only*/ false);
+    profiler.configure(*cfg_, start_time);
+    profiler.startTrace(start_time);
+    profiler.stopTrace(start_time + nanoseconds(duration_ns));
+    libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+    profiler.recordThreadInfo();
+
+    auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+        start_time_ns, start_time_ns + duration_ns);
+    cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+    profiler.transferCpuTrace(std::move(cpuOps));
+
+    auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
+    gpuOps->addRuntimeActivity(
+        CUDA_LAUNCH_KERNEL, start_time_ns + 13, start_time_ns + 18, 1);
+    gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 70, 1);
+
+    // Record event with eventId=42, corrId=100 (session 1 stale data)
+    gpuOps->addCudaEventActivity(
+        /*correlation=*/100, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+
+    cuptiActivities_.activityBuffer = std::move(gpuOps);
+
+    auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+    profiler.processTrace(*logger);
+    // Reset clears the static maps
+    profiler.reset();
+  }
+
+  // === Session 2 ===
+  // Record a NEW event with the same eventId=42 but corrId=500
+  // The wait event should reference corrId=500, not stale corrId=100
+  {
+    CuptiActivityProfiler profiler2(cuptiActivities_, /*cpu only*/ false);
+    // Advance time for session 2
+    int64_t start_time_ns2 = start_time_ns + 10000;
+    auto start_time2 = time_point<system_clock>(nanoseconds(start_time_ns2));
+
+    auto cfg2 = std::make_unique<Config>();
+    cfg2->validate(std::chrono::system_clock::now());
+
+    profiler2.configure(*cfg2, start_time2);
+    profiler2.startTrace(start_time2);
+    profiler2.stopTrace(start_time2 + nanoseconds(duration_ns));
+    libkineto::get_time_converter() = [](approx_time_t t) { return t; };
+    profiler2.recordThreadInfo();
+
+    auto cpuOps2 = std::make_unique<MockCpuActivityBuffer>(
+        start_time_ns2, start_time_ns2 + duration_ns);
+    cpuOps2->addOp("op1", start_time_ns2 + 10, start_time_ns2 + 30, 1);
+    profiler2.transferCpuTrace(std::move(cpuOps2));
+
+    auto gpuOps2 = std::make_unique<MockCuptiActivityBuffer>();
+    gpuOps2->addRuntimeActivity(
+        CUDA_LAUNCH_KERNEL, start_time_ns2 + 13, start_time_ns2 + 18, 1);
+    gpuOps2->addKernelActivity(
+        start_time_ns2 + 50, start_time_ns2 + 70, 1);
+
+    // Record event with eventId=42, corrId=500 (session 2 data)
+    gpuOps2->addCudaEventActivity(
+        /*correlation=*/500, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
+
+    // Stream wait event referencing eventId=42, corrId=501
+    gpuOps2->addSyncActivity(
+        start_time_ns2 + 200,
+        start_time_ns2 + 202,
+        /*correlation=*/501,
+        CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_WAIT_EVENT,
+        /*stream=*/1,
+        /*cudaEventId=*/42);
+
+    cuptiActivities_.activityBuffer = std::move(gpuOps2);
+
+    auto logger2 = std::make_unique<MemoryTraceLogger>(*cfg2);
+    profiler2.processTrace(*logger2);
+    profiler2.reset();
+
+    ActivityTrace trace2(std::move(logger2), loggerFactory);
+
+    // Find the Stream Wait Event and verify it references corrId=500
+    // (session 2 data), not corrId=100 (stale session 1 data)
+    bool foundWaitEvent = false;
+    for (auto& activity : *trace2.activities()) {
+      if (activity->name() == "Stream Wait Event") {
+        foundWaitEvent = true;
+        auto metadata = activity->metadataJson();
+        EXPECT_NE(
+            metadata.find("\"wait_on_cuda_event_record_corr_id\": 500"),
+            std::string::npos)
+            << "Expected corrId 500 in metadata, got: " << metadata;
+        // Must NOT have the stale corrId from session 1
+        EXPECT_EQ(
+            metadata.find("\"wait_on_cuda_event_record_corr_id\": 100"),
+            std::string::npos)
+            << "Should not find stale corrId 100 from session 1, got: "
+            << metadata;
+      }
+    }
+    EXPECT_TRUE(foundWaitEvent)
+        << "Stream Wait Event activity not found in session 2";
+  }
 }
