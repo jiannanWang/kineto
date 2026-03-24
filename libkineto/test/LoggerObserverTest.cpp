@@ -37,9 +37,9 @@ TEST(LoggerObserverTest, SingleCollectorObserver) {
   LOG(ERROR) << ErrorTestStr;
 
   auto LoggerMD = lCollector->extractCollectorMetadata();
-  EXPECT_TRUE(
-      LoggerMD[LoggerOutputType::INFO][0].find(InfoTestStr) !=
-      std::string::npos);
+  // INFO is no longer collected (filtered to avoid invalid JSON from
+  // unescaped quotes in activity metadata log messages).
+  EXPECT_EQ(LoggerMD.count(LoggerOutputType::INFO), 0);
   EXPECT_TRUE(
       LoggerMD[LoggerOutputType::WARNING][0].find(WarningTestStr) !=
       std::string::npos);
@@ -94,7 +94,7 @@ TEST(LoggerObserverTest, FourCollectorObserver) {
     ErrorCount += md.first == LoggerOutputType::ERROR ? md.second.size() : 0;
   }
 
-  EXPECT_EQ(InfoCount, NUM_OF_WRITE_THREADS * NUM_OF_MESSAGES_FOR_EACH_TYPE);
+  EXPECT_EQ(InfoCount, 0);
   EXPECT_EQ(WarnCount, NUM_OF_WRITE_THREADS * NUM_OF_MESSAGES_FOR_EACH_TYPE);
   EXPECT_EQ(ErrorCount, NUM_OF_WRITE_THREADS * NUM_OF_MESSAGES_FOR_EACH_TYPE);
 
@@ -124,9 +124,8 @@ TEST(LoggerObserverTest, AddAndGetLoggerCollector) {
   LOG(ERROR) << ErrorTestStr;
 
   auto metadata = collector->extractCollectorMetadata();
-  EXPECT_TRUE(
-      metadata[LoggerOutputType::INFO][0].find(InfoTestStr) !=
-      std::string::npos);
+  // INFO is no longer collected
+  EXPECT_EQ(metadata.count(LoggerOutputType::INFO), 0);
   EXPECT_TRUE(
       metadata[LoggerOutputType::WARNING][0].find(WarningTestStr) !=
       std::string::npos);
@@ -155,12 +154,12 @@ TEST(LoggerObserverTest, MultipleLoggerCollectors) {
   Logger::addLoggerObserver(c1.get());
   Logger::addLoggerObserver(c2.get());
 
-  LOG(INFO) << InfoTestStr;
+  LOG(WARNING) << WarningTestStr;
 
   auto md1 = c1->extractCollectorMetadata();
   auto md2 = c2->extractCollectorMetadata();
-  EXPECT_EQ(md1[LoggerOutputType::INFO].size(), 1);
-  EXPECT_EQ(md2[LoggerOutputType::INFO].size(), 1);
+  EXPECT_EQ(md1[LoggerOutputType::WARNING].size(), 1);
+  EXPECT_EQ(md2[LoggerOutputType::WARNING].size(), 1);
 
   Logger::removeLoggerObserver(c1.get());
   Logger::removeLoggerObserver(c2.get());

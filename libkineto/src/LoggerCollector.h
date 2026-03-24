@@ -30,7 +30,11 @@ class LoggerCollector : public ILoggerObserver {
   void write(const std::string& message, LoggerOutputType ot = ERROR) override {
     // Skip STAGE output type which is only used by USTLoggerCollector.
     // Skip VERBOSE output type which may bloat metadata section of traces.
-    if (ot == STAGE || ot == VERBOSE) {
+    // Skip INFO output type — these are debug messages that are redundant
+    // with actual trace events and can contain unescaped double quotes
+    // (e.g., from activity metadataJson output) that produce invalid JSON
+    // when serialized into the trace file's metadata section.
+    if (ot == STAGE || ot == VERBOSE || ot == INFO) {
       return;
     }
     buckets_[ot].push_back(message);
