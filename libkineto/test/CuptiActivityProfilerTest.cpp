@@ -890,14 +890,34 @@ TEST_F(CuptiActivityProfilerTest, NcclMetadataOutOfOrderCorrelation) {
       (std::istreambuf_iterator<char>(file)),
       std::istreambuf_iterator<char>());
 
-  // Verify NCCL metadata appears on the GPU kernel event despite
-  // the correlation record arriving after the kernel in the buffer
-  EXPECT_NE(jsonStr.find("all_reduce"), std::string::npos);
-  EXPECT_NE(jsonStr.find("Collective name"), std::string::npos);
-  EXPECT_NE(jsonStr.find("In msg nelems"), std::string::npos);
-  EXPECT_NE(jsonStr.find("Out msg nelems"), std::string::npos);
-  EXPECT_NE(jsonStr.find("Process Group Name"), std::string::npos);
-  EXPECT_NE(jsonStr.find("default_pg"), std::string::npos);
+  // Verify NCCL metadata appears on BOTH the CPU and GPU events.
+  // With count == 2, we know the GPU kernel got the metadata propagated
+  // from the CPU op. Count == 1 would mean only the CPU op has it.
+  auto countSubstrings = [](const std::string& source,
+                            const std::string& substring) {
+    size_t count = 0;
+    size_t pos = source.find(substring);
+    while (pos != std::string::npos) {
+      ++count;
+      pos = source.find(substring, pos + substring.length());
+    }
+    return count;
+  };
+
+  EXPECT_EQ(2, countSubstrings(jsonStr, "all_reduce"))
+      << "Expected all_reduce on both CPU and GPU events";
+  EXPECT_EQ(2, countSubstrings(jsonStr, kCollectiveName))
+      << "Expected Collective name on both CPU and GPU events";
+  EXPECT_EQ(2, countSubstrings(jsonStr, kInMsgNelems))
+      << "Expected In msg nelems on both CPU and GPU events";
+  EXPECT_EQ(2, countSubstrings(jsonStr, kOutMsgNelems))
+      << "Expected Out msg nelems on both CPU and GPU events";
+  EXPECT_EQ(2, countSubstrings(jsonStr, kProcessGroupName))
+      << "Expected Process Group Name on both CPU and GPU events";
+  // "default_pg" appears 3 times: CPU op metadata, GPU kernel metadata,
+  // and distributedInfo block. Check >= 3 to confirm GPU propagation.
+  EXPECT_GE(countSubstrings(jsonStr, "default_pg"), 3)
+      << "Expected default_pg on both CPU and GPU events";
 #endif
 }
 
