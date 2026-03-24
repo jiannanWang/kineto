@@ -58,11 +58,9 @@ struct WaitEventInfo {
 // record that occurred before it (using correlationId as ordering proxy).
 std::unordered_map<CtxEventPair, std::vector<WaitEventInfo>, CtxEventPairHash>&
 waitEventMap() {
-  static std::unordered_map<
-      CtxEventPair,
-      std::vector<WaitEventInfo>,
-      CtxEventPairHash>
-      waitEventMap_;
+  static std::
+      unordered_map<CtxEventPair, std::vector<WaitEventInfo>, CtxEventPairHash>
+          waitEventMap_;
   return waitEventMap_;
 }
 
@@ -405,9 +403,7 @@ void CuptiActivityProfiler::handleCudaSyncActivity(
 
   if (isEventSync(activity->type)) {
     auto maybe_wait_event_info = getWaitEventInfo(
-        activity->contextId,
-        activity->cudaEventId,
-        activity->correlationId);
+        activity->contextId, activity->cudaEventId, activity->correlationId);
     if (maybe_wait_event_info) {
       src_stream = maybe_wait_event_info->stream;
       src_corrid = maybe_wait_event_info->correlationId;

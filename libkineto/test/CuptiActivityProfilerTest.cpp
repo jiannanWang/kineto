@@ -1297,11 +1297,13 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
       auto metadata = activity->metadataJson();
       // The wait_on_cuda_event_record_corr_id should be 100 (the earlier
       // event record), NOT 200 (the later re-record).
-      EXPECT_NE(metadata.find("\"wait_on_cuda_event_record_corr_id\": 100"),
-                std::string::npos)
+      EXPECT_NE(
+          metadata.find("\"wait_on_cuda_event_record_corr_id\": 100"),
+          std::string::npos)
           << "Expected corrId 100 in metadata, got: " << metadata;
-      EXPECT_EQ(metadata.find("\"wait_on_cuda_event_record_corr_id\": 200"),
-                std::string::npos)
+      EXPECT_EQ(
+          metadata.find("\"wait_on_cuda_event_record_corr_id\": 200"),
+          std::string::npos)
           << "Should not find corrId 200 in metadata, got: " << metadata;
     }
   }
@@ -1380,8 +1382,7 @@ TEST_F(CuptiActivityProfilerTest, WaitEventMapClearedOnReset) {
     auto gpuOps2 = std::make_unique<MockCuptiActivityBuffer>();
     gpuOps2->addRuntimeActivity(
         CUDA_LAUNCH_KERNEL, start_time_ns2 + 13, start_time_ns2 + 18, 1);
-    gpuOps2->addKernelActivity(
-        start_time_ns2 + 50, start_time_ns2 + 70, 1);
+    gpuOps2->addKernelActivity(start_time_ns2 + 50, start_time_ns2 + 70, 1);
 
     // No cudaEventRecord for eventId=42 in session 2!
     // Without the fix, the stale corrId=100 from session 1 would be used.
