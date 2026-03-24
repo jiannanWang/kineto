@@ -240,10 +240,10 @@ void GenericActivityProfiler::fixBackwardOperationNesting(
   for (auto& act : cpuTrace.activities) {
     sortedActs.push_back(act.get());
   }
-  std::sort(sortedActs.begin(), sortedActs.end(),
-            [](const auto* a, const auto* b) {
-              return a->startTime < b->startTime;
-            });
+  std::sort(
+      sortedActs.begin(), sortedActs.end(), [](const auto* a, const auto* b) {
+        return a->startTime < b->startTime;
+      });
 
   // For each evaluate_function span, ensure it does not extend past
   // the start of the next evaluate_function at the same nesting level.

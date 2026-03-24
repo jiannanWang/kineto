@@ -1207,14 +1207,18 @@ TEST_F(CuptiActivityProfilerTest, BackwardOperationNesting) {
   // Its real child ends at T=130, but endTime erroneously reaches T=500.
   cpuOps->addOp(
       "autograd::engine::evaluate_function: MulBackward0",
-      start_time_ns + 100, start_time_ns + 500, 1);
+      start_time_ns + 100,
+      start_time_ns + 500,
+      1);
   // Actual child of MulBackward0
   cpuOps->addOp("aten::mul", start_time_ns + 110, start_time_ns + 130, 2);
 
   // A separate backward step that should NOT be wrapped by MulBackward0
   cpuOps->addOp(
       "autograd::engine::evaluate_function: AddBackward0",
-      start_time_ns + 200, start_time_ns + 300, 3);
+      start_time_ns + 200,
+      start_time_ns + 300,
+      3);
   cpuOps->addOp("aten::add", start_time_ns + 210, start_time_ns + 250, 4);
 
   profiler.transferCpuTrace(std::move(cpuOps));
@@ -1281,12 +1285,16 @@ TEST_F(CuptiActivityProfilerTest, BackwardNestingNoFalsePositive) {
   // Two correctly nested evaluate_function spans that do NOT overlap.
   cpuOps->addOp(
       "autograd::engine::evaluate_function: MulBackward0",
-      start_time_ns + 100, start_time_ns + 180, 1);
+      start_time_ns + 100,
+      start_time_ns + 180,
+      1);
   cpuOps->addOp("aten::mul", start_time_ns + 110, start_time_ns + 170, 2);
 
   cpuOps->addOp(
       "autograd::engine::evaluate_function: AddBackward0",
-      start_time_ns + 200, start_time_ns + 300, 3);
+      start_time_ns + 200,
+      start_time_ns + 300,
+      3);
   cpuOps->addOp("aten::add", start_time_ns + 210, start_time_ns + 250, 4);
 
   profiler.transferCpuTrace(std::move(cpuOps));
