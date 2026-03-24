@@ -1221,36 +1221,61 @@ TEST_F(CuptiActivityProfilerTest, BackwardDuplicateFlowIds) {
   libkineto::get_time_converter() = [](approx_time_t t) { return t; };
   profiler.recordThreadInfo();
 
-  // Create CPU ops simulating forward and backward pass with duplicate flow IDs.
-  // The bug: multiple backward ops share the same flow ID (e.g., 42),
+  // Create CPU ops simulating forward and backward pass with duplicate flow
+  // IDs. The bug: multiple backward ops share the same flow ID (e.g., 42),
   // making them indistinguishable in traces.
   auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
       start_time_ns, start_time_ns + duration_ns);
 
   // Forward op with flow ID 42 (flow start)
   cpuOps->addOpWithFlow(
-      "forward_op", start_time_ns + 10, start_time_ns + 50, 1,
-      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/true);
+      "forward_op",
+      start_time_ns + 10,
+      start_time_ns + 50,
+      1,
+      /*flowId=*/42,
+      /*flowType=*/kLinkFwdBwd,
+      /*flowStart=*/true);
 
   // First backward op with flow ID 42 (flow end) - this is OK
   cpuOps->addOpWithFlow(
-      "MulBackward0", start_time_ns + 60, start_time_ns + 100, 2,
-      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+      "MulBackward0",
+      start_time_ns + 60,
+      start_time_ns + 100,
+      2,
+      /*flowId=*/42,
+      /*flowType=*/kLinkFwdBwd,
+      /*flowStart=*/false);
 
   // Second backward op with SAME flow ID 42 (flow end) - this is the BUG
   cpuOps->addOpWithFlow(
-      "AddBackward0", start_time_ns + 110, start_time_ns + 150, 3,
-      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+      "AddBackward0",
+      start_time_ns + 110,
+      start_time_ns + 150,
+      3,
+      /*flowId=*/42,
+      /*flowType=*/kLinkFwdBwd,
+      /*flowStart=*/false);
 
   // Third backward op with SAME flow ID 42 (flow end) - also a duplicate
   cpuOps->addOpWithFlow(
-      "ReluBackward0", start_time_ns + 160, start_time_ns + 200, 4,
-      /*flowId=*/42, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+      "ReluBackward0",
+      start_time_ns + 160,
+      start_time_ns + 200,
+      4,
+      /*flowId=*/42,
+      /*flowType=*/kLinkFwdBwd,
+      /*flowStart=*/false);
 
   // A non-duplicate backward op with a different flow ID 99
   cpuOps->addOpWithFlow(
-      "SigmoidBackward0", start_time_ns + 210, start_time_ns + 250, 5,
-      /*flowId=*/99, /*flowType=*/kLinkFwdBwd, /*flowStart=*/false);
+      "SigmoidBackward0",
+      start_time_ns + 210,
+      start_time_ns + 250,
+      5,
+      /*flowId=*/99,
+      /*flowType=*/kLinkFwdBwd,
+      /*flowStart=*/false);
 
   profiler.transferCpuTrace(std::move(cpuOps));
 
