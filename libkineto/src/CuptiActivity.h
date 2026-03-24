@@ -210,7 +210,9 @@ struct CudaSyncActivity : public CuptiActivity<CUpti_ActivitySynchronization> {
                             int32_t srcStream,
                             int32_t srcCorrId,
                             int64_t adjustedStartTime = -1)
-      : CuptiActivity(activity, linked), srcStream_(srcStream), srcCorrId_(srcCorrId),
+      : CuptiActivity(activity, linked),
+        srcStream_(srcStream),
+        srcCorrId_(srcCorrId),
         adjustedStartTime_(adjustedStartTime) {}
   int64_t correlationId() const override {
     return raw().correlationId;
@@ -223,8 +225,7 @@ struct CudaSyncActivity : public CuptiActivity<CUpti_ActivitySynchronization> {
   }
   int64_t duration() const override {
     if (adjustedStartTime_ >= 0) {
-      int64_t originalEnd =
-          CuptiActivity<CUpti_ActivitySynchronization>::timestamp() +
+      int64_t originalEnd = CuptiActivity<CUpti_ActivitySynchronization>::timestamp() +
           CuptiActivity<CUpti_ActivitySynchronization>::duration();
       return std::max<int64_t>(0, originalEnd - adjustedStartTime_);
     }

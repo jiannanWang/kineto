@@ -699,9 +699,9 @@ TEST_F(CuptiActivityProfilerTest, StreamSyncTimingAdjustment) {
   // don't finish until start_time_ns + 350. The sync's start should be
   // adjusted to start_time_ns + 350.
   gpuOps->addSyncActivity(
-      start_time_ns + 130,   // start (before last kernel ends)
-      start_time_ns + 400,   // end
-      6,                     // correlation
+      start_time_ns + 130, // start (before last kernel ends)
+      start_time_ns + 400, // end
+      6, // correlation
       CUPTI_ACTIVITY_SYNCHRONIZATION_TYPE_STREAM_SYNCHRONIZE,
       1 /*stream*/);
 
