@@ -1245,41 +1245,65 @@ TEST_F(CuptiActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
   profiler.transferCpuTrace(std::move(cpuOps));
 
-  // Scenario: CUPTI delivers events out of order in its buffer.
-  // Timeline order (by correlation ID):
-  //   corrId=100: cudaEventRecord(event42) - the record we want to reference
-  //   corrId=101: cudaStreamWaitEvent(event42) - the wait event
-  //   corrId=200: cudaEventRecord(event42) - a LATER re-record
+  // ---------------------------------------------------------------------------
+  // Background: CUDA events and correlation IDs
   //
-  // But CUPTI delivers them in buffer order that puts the re-record BEFORE
-  // the wait event. Without the fix, the old code overwrites the map entry
-  // with corrId=200 before processing the wait event, so the wait event
-  // incorrectly references the future re-record (corrId=200).
+  // A CUDA event (identified by eventId) is a reusable synchronization
+  // primitive. User code can:
+  //   1. cudaEventRecord(event)       — "plant a flag" on a stream
+  //   2. cudaStreamWaitEvent(event)   — "don't proceed until that flag is hit"
+  //   3. cudaEventRecord(event) again — re-plant the same flag (reuse)
   //
-  // With the fix, the code uses correlation ID ordering to find the most
-  // recent event record BEFORE the wait event (corrId=100).
+  // Each of these CUDA API calls gets a unique, monotonically-increasing
+  // correlationId from CUPTI — this is how we tell API calls apart even
+  // when they reference the same eventId.
+  //
+  // The profiler needs to answer: when a cudaStreamWaitEvent is processed,
+  // which cudaEventRecord does it correspond to? We look up by eventId and
+  // pick the most recent record that occurred *before* the wait.
+  //
+  // ---------------------------------------------------------------------------
+  // What this test simulates
+  //
+  // Three CUDA API calls happen in this chronological order:
+  //   corrId=100: cudaEventRecord(event42)      — record we want to reference
+  //   corrId=101: cudaStreamWaitEvent(event42)   — the wait event
+  //   corrId=200: cudaEventRecord(event42)       — a LATER re-record of same
+  //   event
+  //
+  // But CUPTI delivers them in a different buffer order:
+  //   Buffer[0]: cudaEventRecord    corrId=100   (correct, early)
+  //   Buffer[1]: cudaEventRecord    corrId=200   (re-record, delivered early!)
+  //   Buffer[2]: cudaStreamWaitEvent corrId=101  (the wait)
+  //
+  // Bug (old code): each cudaEventRecord overwrites the map entry for
+  // eventId=42. By the time the wait is processed, the map says
+  // "event42 was last recorded with corrId=200" — but that's a FUTURE
+  // API call relative to the wait at corrId=101.
+  //
+  // Fix (new code): stores ALL records for eventId=42 and picks the one
+  // with the highest correlationId that is still <= 101. That's corrId=100.
+  // ---------------------------------------------------------------------------
   auto gpuOps = std::make_unique<MockCuptiActivityBuffer>();
 
-  // Runtime activities for correlation
+  // Scaffolding: a runtime + kernel activity on stream 1 so the profiler
+  // considers this stream "active" and doesn't skip the deferred wait event.
   gpuOps->addRuntimeActivity(
       CUDA_LAUNCH_KERNEL, start_time_ns + 13, start_time_ns + 18, 1);
-
-  // Add a kernel so stream 1 has GPU activity (needed for deferred logging)
   gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 70, 1);
 
-  // cudaEventRecord(event42) - earlier, corrId=100
+  // Buffer[0]: cudaEventRecord(event42), corrId=100 — the earlier record
   gpuOps->addCudaEventActivity(
       /*correlation=*/100, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
 
-  // KEY: CUPTI delivers the LATER re-record BEFORE the wait event in buffer
-  // cudaEventRecord(event42) again - later, corrId=200 (re-record)
-  // This overwrites the map entry in the old code!
+  // Buffer[1]: cudaEventRecord(event42), corrId=200 — later re-record,
+  // but CUPTI delivered it before the wait event in the buffer.
+  // In the old code, this overwrites the map entry for eventId=42!
   gpuOps->addCudaEventActivity(
       /*correlation=*/200, /*eventId=*/42, /*streamId=*/1, /*contextId=*/0);
 
-  // cudaStreamWaitEvent(event42) - corrId=101
-  // This sync event should reference the event record with corrId=100
-  // (the one before it by correlation ID order), NOT corrId=200
+  // Buffer[2]: cudaStreamWaitEvent(event42), corrId=101
+  // This should reference corrId=100 (the record before it), NOT corrId=200.
   gpuOps->addSyncActivity(
       start_time_ns + 200,
       start_time_ns + 202,
