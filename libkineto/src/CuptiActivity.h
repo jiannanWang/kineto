@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <cuda_occupancy.h>
 #include <cupti.h>
 
 #include <fmt/format.h>
